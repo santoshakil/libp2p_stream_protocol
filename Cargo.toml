@@ -1,13 +1,13 @@
 [package]
-name = "libp2p_stream_protocol"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.65.0"
-authors = ["Santo Shakil <shakil.mezbah@gmail.com>"]
-description = "Stream Protocols for libp2p"
-keywords = ["peer-to-peer", "libp2p", "networking", "stream"]
-categories = ["network-programming", "asynchronous"]
 license = "MIT"
+edition = "2021"
+version = "0.1.0"
+rust-version = "1.65.0"
+name = "libp2p_stream_protocol"
+description = "Stream Protocols for libp2p"
+authors = ["Santo Shakil <shakil.mezbah@gmail.com>"]
+categories = ["network-programming", "asynchronous"]
+keywords = ["peer-to-peer", "libp2p", "networking", "stream"]
 repository = "https://github.com/santoshakil/libp2p_stream_protocol"
 
 

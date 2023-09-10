@@ -53,9 +53,9 @@ mod codec {
     use std::{collections::TryReserveError, convert::Infallible, io, marker::PhantomData};
 
     /// Max request size in bytes
-    const REQUEST_SIZE_MAXIMUM: u64 = 1024 * 1024;
+    const REQUEST_SIZE_MAXIMUM: u64 = 10 * 1024 * 1024;
     /// Max response size in bytes
-    const RESPONSE_SIZE_MAXIMUM: u64 = 10 * 1024 * 1024;
+    const RESPONSE_SIZE_MAXIMUM: u64 = 200 * 1024 * 1024;
 
     pub struct Codec<Req, Resp> {
         phantom: PhantomData<(Req, Resp)>,

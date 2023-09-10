@@ -1,4 +1,4 @@
-// Copyright 2020 Parity Technologies (UK) Ltd.
+// Copyright 2019 Parity Technologies (UK) Ltd.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
 // copy of this software and associated documentation files (the "Software"),
@@ -18,330 +18,317 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-pub(crate) mod protocol;
-
-pub use protocol::ProtocolSupport;
-
-use crate::codec::Codec;
-use crate::handler::protocol::{RequestProtocol, ResponseProtocol};
-use crate::{RequestId, EMPTY_QUEUE_SHRINK_THRESHOLD};
-
-use futures::{channel::oneshot, future::BoxFuture, prelude::*, stream::FuturesUnordered};
-use instant::Instant;
+use crate::{protocol, PROTOCOL_NAME};
+use futures::future::{BoxFuture, Either};
+use futures::prelude::*;
+use futures_timer::Delay;
+use libp2p_core::upgrade::ReadyUpgrade;
+use libp2p_identity::PeerId;
 use libp2p_swarm::handler::{
     ConnectionEvent, DialUpgradeError, FullyNegotiatedInbound, FullyNegotiatedOutbound,
-    ListenUpgradeError,
 };
 use libp2p_swarm::{
-    handler::{ConnectionHandler, ConnectionHandlerEvent, KeepAlive, StreamUpgradeError},
-    SubstreamProtocol,
+    ConnectionHandler, ConnectionHandlerEvent, KeepAlive, Stream, StreamProtocol,
+    StreamUpgradeError, SubstreamProtocol,
 };
-use smallvec::SmallVec;
+use std::collections::VecDeque;
 use std::{
-    collections::VecDeque,
-    fmt,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    error::Error,
+    fmt, io,
     task::{Context, Poll},
     time::Duration,
 };
+use void::Void;
 
-/// A connection handler for a request response [`Behaviour`](super::Behaviour) protocol.
-pub struct Handler<TCodec>
-where
-    TCodec: Codec,
-{
-    /// The supported inbound protocols.
-    inbound_protocols: SmallVec<[TCodec::Protocol; 2]>,
-    /// The request/response message codec.
-    codec: TCodec,
-    /// The keep-alive timeout of idle connections. A connection is considered
-    /// idle if there are no outbound substreams.
-    keep_alive_timeout: Duration,
-    /// The timeout for inbound and outbound substreams (i.e. request
-    /// and response processing).
-    substream_timeout: Duration,
-    /// The current connection keep-alive.
-    keep_alive: KeepAlive,
-    /// Queue of events to emit in `poll()`.
-    pending_events: VecDeque<Event<TCodec>>,
-    /// Outbound upgrades waiting to be emitted as an `OutboundSubstreamRequest`.
-    outbound: VecDeque<RequestProtocol<TCodec>>,
-    /// Inbound upgrades waiting for the incoming request.
-    inbound: FuturesUnordered<
-        BoxFuture<
-            'static,
-            Result<
-                (
-                    (RequestId, TCodec::Request),
-                    oneshot::Sender<TCodec::Response>,
-                ),
-                oneshot::Canceled,
-            >,
-        >,
-    >,
-    inbound_request_id: Arc<AtomicU64>,
+/// The configuration for outbound pings.
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// The timeout of an outbound ping.
+    timeout: Duration,
+    /// The duration between outbound pings.
+    interval: Duration,
 }
 
-impl<TCodec> Handler<TCodec>
-where
-    TCodec: Codec + Send + Clone + 'static,
-{
-    pub(super) fn new(
-        inbound_protocols: SmallVec<[TCodec::Protocol; 2]>,
-        codec: TCodec,
-        keep_alive_timeout: Duration,
-        substream_timeout: Duration,
-        inbound_request_id: Arc<AtomicU64>,
-    ) -> Self {
+impl Config {
+    /// Creates a new [`Config`] with the following default settings:
+    ///
+    ///   * [`Config::with_interval`] 15s
+    ///   * [`Config::with_timeout`] 20s
+    ///
+    /// These settings have the following effect:
+    ///
+    ///   * A ping is sent every 15 seconds on a healthy connection.
+    ///   * Every ping sent must yield a response within 20 seconds in order to
+    ///     be successful.
+    pub fn new() -> Self {
         Self {
-            inbound_protocols,
-            codec,
-            keep_alive: KeepAlive::Yes,
-            keep_alive_timeout,
-            substream_timeout,
-            outbound: VecDeque::new(),
-            inbound: FuturesUnordered::new(),
-            pending_events: VecDeque::new(),
-            inbound_request_id,
+            timeout: Duration::from_secs(20),
+            interval: Duration::from_secs(15),
         }
     }
 
-    fn on_fully_negotiated_inbound(
-        &mut self,
-        FullyNegotiatedInbound {
-            protocol: sent,
-            info: request_id,
-        }: FullyNegotiatedInbound<
-            <Self as ConnectionHandler>::InboundProtocol,
-            <Self as ConnectionHandler>::InboundOpenInfo,
-        >,
-    ) {
-        if sent {
-            self.pending_events
-                .push_back(Event::ResponseSent(request_id))
-        } else {
-            self.pending_events
-                .push_back(Event::ResponseOmission(request_id))
+    /// Sets the ping timeout.
+    pub fn with_timeout(mut self, d: Duration) -> Self {
+        self.timeout = d;
+        self
+    }
+
+    /// Sets the ping interval.
+    pub fn with_interval(mut self, d: Duration) -> Self {
+        self.interval = d;
+        self
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// An outbound ping failure.
+#[derive(Debug)]
+pub enum Failure {
+    /// The ping timed out, i.e. no response was received within the
+    /// configured ping timeout.
+    Timeout,
+    /// The peer does not support the ping protocol.
+    Unsupported,
+    /// The ping failed for reasons other than a timeout.
+    Other {
+        error: Box<dyn std::error::Error + Send + 'static>,
+    },
+}
+
+impl Failure {
+    fn other(e: impl std::error::Error + Send + 'static) -> Self {
+        Self::Other { error: Box::new(e) }
+    }
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Failure::Timeout => f.write_str("Ping timeout"),
+            Failure::Other { error } => write!(f, "Ping error: {error}"),
+            Failure::Unsupported => write!(f, "Ping protocol not supported"),
+        }
+    }
+}
+
+impl Error for Failure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Failure::Timeout => None,
+            Failure::Other { error } => Some(&**error),
+            Failure::Unsupported => None,
+        }
+    }
+}
+
+/// Protocol handler that handles pinging the remote at a regular period
+/// and answering ping queries.
+pub struct Handler {
+    /// Configuration options.
+    config: Config,
+    /// The timer used for the delay to the next ping.
+    interval: Delay,
+    /// Outbound ping failures that are pending to be processed by `poll()`.
+    pending_errors: VecDeque<Failure>,
+    /// The number of consecutive ping failures that occurred.
+    ///
+    /// Each successful ping resets this counter to 0.
+    failures: u32,
+    /// The outbound ping state.
+    outbound: Option<OutboundState>,
+    /// The inbound pong handler, i.e. if there is an inbound
+    /// substream, this is always a future that waits for the
+    /// next inbound ping to be answered.
+    inbound: Option<PongFuture>,
+    /// Tracks the state of our handler.
+    state: State,
+    /// The peer we are connected to.
+    peer: PeerId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    /// We are inactive because the other peer doesn't support ping.
+    Inactive {
+        /// Whether or not we've reported the missing support yet.
+        ///
+        /// This is used to avoid repeated events being emitted for a specific connection.
+        reported: bool,
+    },
+    /// We are actively pinging the other peer.
+    Active,
+}
+
+impl Handler {
+    /// Builds a new [`Handler`] with the given configuration.
+    pub fn new(config: Config, peer: PeerId) -> Self {
+        Handler {
+            peer,
+            config,
+            interval: Delay::new(Duration::new(0, 0)),
+            pending_errors: VecDeque::with_capacity(2),
+            failures: 0,
+            outbound: None,
+            inbound: None,
+            state: State::Active,
         }
     }
 
     fn on_dial_upgrade_error(
         &mut self,
-        DialUpgradeError { info, error }: DialUpgradeError<
+        DialUpgradeError { error, .. }: DialUpgradeError<
             <Self as ConnectionHandler>::OutboundOpenInfo,
             <Self as ConnectionHandler>::OutboundProtocol,
         >,
     ) {
-        match error {
-            StreamUpgradeError::Timeout => {
-                self.pending_events.push_back(Event::OutboundTimeout(info));
-            }
+        self.outbound = None; // Request a new substream on the next `poll`.
+
+        let error = match error {
             StreamUpgradeError::NegotiationFailed => {
-                // The remote merely doesn't support the protocol(s) we requested.
-                // This is no reason to close the connection, which may
-                // successfully communicate with other protocols already.
-                // An event is reported to permit user code to react to the fact that
-                // the remote peer does not support the requested protocol(s).
-                self.pending_events
-                    .push_back(Event::OutboundUnsupportedProtocols(info));
+                debug_assert_eq!(self.state, State::Active);
+
+                self.state = State::Inactive { reported: false };
+                return;
             }
-            StreamUpgradeError::Apply(e) => {
-                log::debug!("outbound stream {info} failed: {e}");
-            }
-            StreamUpgradeError::Io(e) => {
-                log::debug!("outbound stream {info} failed: {e}");
-            }
-        }
-    }
-    fn on_listen_upgrade_error(
-        &mut self,
-        ListenUpgradeError { error, info }: ListenUpgradeError<
-            <Self as ConnectionHandler>::InboundOpenInfo,
-            <Self as ConnectionHandler>::InboundProtocol,
-        >,
-    ) {
-        log::debug!("inbound stream {info} failed: {error}");
-    }
-}
-
-/// The events emitted by the [`Handler`].
-pub enum Event<TCodec>
-where
-    TCodec: Codec,
-{
-    /// A request has been received.
-    Request {
-        request_id: RequestId,
-        request: TCodec::Request,
-        sender: oneshot::Sender<TCodec::Response>,
-    },
-    /// A response has been received.
-    Response {
-        request_id: RequestId,
-        response: TCodec::Response,
-    },
-    /// A response to an inbound request has been sent.
-    ResponseSent(RequestId),
-    /// A response to an inbound request was omitted as a result
-    /// of dropping the response `sender` of an inbound `Request`.
-    ResponseOmission(RequestId),
-    /// An outbound request timed out while sending the request
-    /// or waiting for the response.
-    OutboundTimeout(RequestId),
-    /// An outbound request failed to negotiate a mutually supported protocol.
-    OutboundUnsupportedProtocols(RequestId),
-}
-
-impl<TCodec: Codec> fmt::Debug for Event<TCodec> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Event::Request {
-                request_id,
-                request: _,
-                sender: _,
-            } => f
-                .debug_struct("Event::Request")
-                .field("request_id", request_id)
-                .finish(),
-            Event::Response {
-                request_id,
-                response: _,
-            } => f
-                .debug_struct("Event::Response")
-                .field("request_id", request_id)
-                .finish(),
-            Event::ResponseSent(request_id) => f
-                .debug_tuple("Event::ResponseSent")
-                .field(request_id)
-                .finish(),
-            Event::ResponseOmission(request_id) => f
-                .debug_tuple("Event::ResponseOmission")
-                .field(request_id)
-                .finish(),
-            Event::OutboundTimeout(request_id) => f
-                .debug_tuple("Event::OutboundTimeout")
-                .field(request_id)
-                .finish(),
-            Event::OutboundUnsupportedProtocols(request_id) => f
-                .debug_tuple("Event::OutboundUnsupportedProtocols")
-                .field(request_id)
-                .finish(),
-        }
-    }
-}
-
-impl<TCodec> ConnectionHandler for Handler<TCodec>
-where
-    TCodec: Codec + Send + Clone + 'static,
-{
-    type FromBehaviour = RequestProtocol<TCodec>;
-    type ToBehaviour = Event<TCodec>;
-    type Error = void::Void;
-    type InboundProtocol = ResponseProtocol<TCodec>;
-    type OutboundProtocol = RequestProtocol<TCodec>;
-    type OutboundOpenInfo = RequestId;
-    type InboundOpenInfo = RequestId;
-
-    fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, Self::InboundOpenInfo> {
-        // A channel for notifying the handler when the inbound
-        // upgrade received the request.
-        let (rq_send, rq_recv) = oneshot::channel();
-
-        // A channel for notifying the inbound upgrade when the
-        // response is sent.
-        let (rs_send, rs_recv) = oneshot::channel();
-
-        let request_id = RequestId(self.inbound_request_id.fetch_add(1, Ordering::Relaxed));
-
-        // By keeping all I/O inside the `ResponseProtocol` and thus the
-        // inbound substream upgrade via above channels, we ensure that it
-        // is all subject to the configured timeout without extra bookkeeping
-        // for inbound substreams as well as their timeouts and also make the
-        // implementation of inbound and outbound upgrades symmetric in
-        // this sense.
-        let proto = ResponseProtocol {
-            protocols: self.inbound_protocols.clone(),
-            codec: self.codec.clone(),
-            request_sender: rq_send,
-            response_receiver: rs_recv,
-            request_id,
+            // Note: This timeout only covers protocol negotiation.
+            StreamUpgradeError::Timeout => Failure::Other {
+                error: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "ping protocol negotiation timed out",
+                )),
+            },
+            StreamUpgradeError::Apply(e) => void::unreachable(e),
+            StreamUpgradeError::Io(e) => Failure::Other { error: Box::new(e) },
         };
 
-        // The handler waits for the request to come in. It then emits
-        // `Event::Request` together with a
-        // `ResponseChannel`.
-        self.inbound
-            .push(rq_recv.map_ok(move |rq| (rq, rs_send)).boxed());
+        self.pending_errors.push_front(error);
+    }
+}
 
-        SubstreamProtocol::new(proto, request_id).with_timeout(self.substream_timeout)
+impl ConnectionHandler for Handler {
+    type FromBehaviour = Void;
+    type ToBehaviour = Result<Duration, Failure>;
+    type Error = Void;
+    type InboundProtocol = ReadyUpgrade<StreamProtocol>;
+    type OutboundProtocol = ReadyUpgrade<StreamProtocol>;
+    type OutboundOpenInfo = ();
+    type InboundOpenInfo = ();
+
+    fn listen_protocol(&self) -> SubstreamProtocol<ReadyUpgrade<StreamProtocol>, ()> {
+        SubstreamProtocol::new(ReadyUpgrade::new(PROTOCOL_NAME), ())
     }
 
-    fn on_behaviour_event(&mut self, request: Self::FromBehaviour) {
-        self.keep_alive = KeepAlive::Yes;
-        self.outbound.push_back(request);
-    }
+    fn on_behaviour_event(&mut self, _: Void) {}
 
     fn connection_keep_alive(&self) -> KeepAlive {
-        self.keep_alive
+        KeepAlive::No
     }
 
     fn poll(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<
-        ConnectionHandlerEvent<RequestProtocol<TCodec>, RequestId, Self::ToBehaviour, Self::Error>,
+        ConnectionHandlerEvent<
+            ReadyUpgrade<StreamProtocol>,
+            (),
+            Result<Duration, Failure>,
+            Self::Error,
+        >,
     > {
-        // Drain pending events.
-        if let Some(event) = self.pending_events.pop_front() {
-            return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(event));
-        } else if self.pending_events.capacity() > EMPTY_QUEUE_SHRINK_THRESHOLD {
-            self.pending_events.shrink_to_fit();
+        match self.state {
+            State::Inactive { reported: true } => {
+                return Poll::Pending; // nothing to do on this connection
+            }
+            State::Inactive { reported: false } => {
+                self.state = State::Inactive { reported: true };
+                return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(Err(
+                    Failure::Unsupported,
+                )));
+            }
+            State::Active => {}
         }
 
-        // Check for inbound requests.
-        while let Poll::Ready(Some(result)) = self.inbound.poll_next_unpin(cx) {
-            match result {
-                Ok(((id, rq), rs_sender)) => {
-                    // We received an inbound request.
-                    self.keep_alive = KeepAlive::Yes;
-                    return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(Event::Request {
-                        request_id: id,
-                        request: rq,
-                        sender: rs_sender,
-                    }));
+        // Respond to inbound pings.
+        if let Some(fut) = self.inbound.as_mut() {
+            match fut.poll_unpin(cx) {
+                Poll::Pending => {}
+                Poll::Ready(Err(e)) => {
+                    log::debug!("Inbound ping error: {:?}", e);
+                    self.inbound = None;
                 }
-                Err(oneshot::Canceled) => {
-                    // The inbound upgrade has errored or timed out reading
-                    // or waiting for the request. The handler is informed
-                    // via `on_connection_event` call with `ConnectionEvent::ListenUpgradeError`.
+                Poll::Ready(Ok(stream)) => {
+                    log::trace!("answered inbound ping from {}", self.peer);
+
+                    // A ping from a remote peer has been answered, wait for the next.
+                    self.inbound = Some(protocol::recv_ping(stream).boxed());
                 }
             }
         }
 
-        // Emit outbound requests.
-        if let Some(request) = self.outbound.pop_front() {
-            let info = request.request_id;
-            return Poll::Ready(ConnectionHandlerEvent::OutboundSubstreamRequest {
-                protocol: SubstreamProtocol::new(request, info)
-                    .with_timeout(self.substream_timeout),
-            });
-        }
+        loop {
+            // Check for outbound ping failures.
+            if let Some(error) = self.pending_errors.pop_back() {
+                log::debug!("Ping failure: {:?}", error);
 
-        debug_assert!(self.outbound.is_empty());
+                self.failures += 1;
 
-        if self.outbound.capacity() > EMPTY_QUEUE_SHRINK_THRESHOLD {
-            self.outbound.shrink_to_fit();
-        }
+                // Note: For backward-compatibility the first failure is always "free"
+                // and silent. This allows peers who use a new substream
+                // for each ping to have successful ping exchanges with peers
+                // that use a single substream, since every successful ping
+                // resets `failures` to `0`.
+                if self.failures > 1 {
+                    return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(Err(error)));
+                }
+            }
 
-        if self.inbound.is_empty() && self.keep_alive.is_yes() {
-            // No new inbound or outbound requests. However, we may just have
-            // started the latest inbound or outbound upgrade(s), so make sure
-            // the keep-alive timeout is preceded by the substream timeout.
-            let until = Instant::now() + self.substream_timeout + self.keep_alive_timeout;
-            self.keep_alive = KeepAlive::Until(until);
+            // Continue outbound pings.
+            match self.outbound.take() {
+                Some(OutboundState::Ping(mut ping)) => match ping.poll_unpin(cx) {
+                    Poll::Pending => {
+                        self.outbound = Some(OutboundState::Ping(ping));
+                        break;
+                    }
+                    Poll::Ready(Ok((stream, rtt))) => {
+                        log::debug!("latency to {} is {}ms", self.peer, rtt.as_millis());
+
+                        self.failures = 0;
+                        self.interval.reset(self.config.interval);
+                        self.outbound = Some(OutboundState::Idle(stream));
+                        return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(Ok(rtt)));
+                    }
+                    Poll::Ready(Err(e)) => {
+                        self.pending_errors.push_front(e);
+                    }
+                },
+                Some(OutboundState::Idle(stream)) => match self.interval.poll_unpin(cx) {
+                    Poll::Pending => {
+                        self.outbound = Some(OutboundState::Idle(stream));
+                        break;
+                    }
+                    Poll::Ready(()) => {
+                        self.outbound = Some(OutboundState::Ping(
+                            send_ping(stream, self.config.timeout).boxed(),
+                        ));
+                    }
+                },
+                Some(OutboundState::OpenStream) => {
+                    self.outbound = Some(OutboundState::OpenStream);
+                    break;
+                }
+                None => {
+                    self.outbound = Some(OutboundState::OpenStream);
+                    let protocol = SubstreamProtocol::new(ReadyUpgrade::new(PROTOCOL_NAME), ());
+                    return Poll::Ready(ConnectionHandlerEvent::OutboundSubstreamRequest {
+                        protocol,
+                    });
+                }
+            }
         }
 
         Poll::Pending
@@ -357,27 +344,52 @@ where
         >,
     ) {
         match event {
-            ConnectionEvent::FullyNegotiatedInbound(fully_negotiated_inbound) => {
-                self.on_fully_negotiated_inbound(fully_negotiated_inbound)
+            ConnectionEvent::FullyNegotiatedInbound(FullyNegotiatedInbound {
+                protocol: stream,
+                ..
+            }) => {
+                self.inbound = Some(protocol::recv_ping(stream).boxed());
             }
             ConnectionEvent::FullyNegotiatedOutbound(FullyNegotiatedOutbound {
-                protocol: response,
-                info: request_id,
+                protocol: stream,
+                ..
             }) => {
-                self.pending_events.push_back(Event::Response {
-                    request_id,
-                    response,
-                });
+                self.outbound = Some(OutboundState::Ping(
+                    send_ping(stream, self.config.timeout).boxed(),
+                ));
             }
             ConnectionEvent::DialUpgradeError(dial_upgrade_error) => {
                 self.on_dial_upgrade_error(dial_upgrade_error)
             }
-            ConnectionEvent::ListenUpgradeError(listen_upgrade_error) => {
-                self.on_listen_upgrade_error(listen_upgrade_error)
-            }
             ConnectionEvent::AddressChange(_)
+            | ConnectionEvent::ListenUpgradeError(_)
             | ConnectionEvent::LocalProtocolsChange(_)
             | ConnectionEvent::RemoteProtocolsChange(_) => {}
         }
+    }
+}
+
+type PingFuture = BoxFuture<'static, Result<(Stream, Duration), Failure>>;
+type PongFuture = BoxFuture<'static, Result<Stream, io::Error>>;
+
+/// The current state w.r.t. outbound pings.
+enum OutboundState {
+    /// A new substream is being negotiated for the ping protocol.
+    OpenStream,
+    /// The substream is idle, waiting to send the next ping.
+    Idle(Stream),
+    /// A ping is being sent and the response awaited.
+    Ping(PingFuture),
+}
+
+/// A wrapper around [`protocol::send_ping`] that enforces a time out.
+async fn send_ping(stream: Stream, timeout: Duration) -> Result<(Stream, Duration), Failure> {
+    let ping = protocol::send_ping(stream);
+    futures::pin_mut!(ping);
+
+    match future::select(ping, Delay::new(timeout)).await {
+        Either::Left((Ok((stream, rtt)), _)) => Ok((stream, rtt)),
+        Either::Left((Err(e), _)) => Err(Failure::other(e)),
+        Either::Right(((), _)) => Err(Failure::Timeout),
     }
 }

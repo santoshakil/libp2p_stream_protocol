@@ -10,16 +10,14 @@ categories = ["network-programming", "asynchronous"]
 keywords = ["peer-to-peer", "libp2p", "networking", "stream"]
 repository = "https://github.com/santoshakil/libp2p_stream_protocol"
 
-
-[dependencies.async-trait]
-version = "0.1"
-
-[dependencies.cbor4ii]
-version = "0.3.1"
-features = ["serde1", "use_std"]
+[dependencies.either]
+version = "1.8.0"
 
 [dependencies.futures]
 version = "0.3.28"
+
+[dependencies.futures-timer]
+version = "3.0.2"
 
 [dependencies.instant]
 version = "0.1.12"
@@ -28,10 +26,10 @@ version = "0.1.12"
 version = "0.40.0"
 
 [dependencies.libp2p-identity]
-version = "0.2.2"
+version = "0.2.0"
 
 [dependencies.libp2p-swarm]
-version = "0.43.3"
+version = "0.43.0"
 
 [dependencies.log]
 version = "0.4.19"
@@ -39,38 +37,18 @@ version = "0.4.19"
 [dependencies.rand]
 version = "0.8"
 
-[dependencies.serde]
-version = "1.0"
-
-[dependencies.smallvec]
-version = "1.11.0"
-
 [dependencies.void]
-version = "1.0.2"
+version = "1.0"
 
 [dev-dependencies.async-std]
 version = "1.6.2"
-features = ["attributes"]
 
 [dev-dependencies.env_logger]
 version = "0.10.0"
 
-[dev-dependencies.futures_ringbuf]
-version = "0.4.0"
-
-[dev-dependencies.libp2p-noise]
+[dev-dependencies.libp2p-swarm]
 version = "0.43.0"
+features = ["macros"]
 
-[dev-dependencies.libp2p-tcp]
-version = "0.40.0"
-features = ["async-io"]
-
-[dev-dependencies.libp2p-yamux]
-version = "0.44.1"
-
-[dev-dependencies.rand]
-version = "0.8"
-
-[dev-dependencies.serde]
-version = "1.0"
-features = ["derive"]
+[dev-dependencies.libp2p-swarm-test]
+version = "0.2.0"
